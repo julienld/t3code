@@ -1,0 +1,172 @@
+name: Stable Windows server
+
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Build revision for the current upstream stable
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: julien-stable-windows
+  cancel-in-progress: false
+
+jobs:
+  select:
+    if: github.repository == 'julienld/t3code' && github.ref == 'refs/heads/stable'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      fork_tag: ${{ steps.release.outputs.fork_tag }}
+      build: ${{ steps.release.outputs.build }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision || '1' }}
+        run: |
+          set -euo pipefail
+          upstream=$(gh api repos/pingdotgg/t3code/releases/latest \
+            --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+          [[ "$upstream" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$REVISION" =~ ^[1-9][0-9]{0,3}$ ]]
+          fork="julien/$upstream-r$REVISION"
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -sr --arg tag "$fork" 'any(.[][]; .tag_name == $tag and (.draft | not) and
+              (.prerelease | not) and any(.assets[]; .name == "t3.exe" and .state == "uploaded"))')
+          {
+            echo "upstream_tag=$upstream"
+            echo "fork_tag=$fork"
+            if [[ "$existing" == true ]]; then echo "build=false"; else echo "build=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_TAG: ${{ needs.select.outputs.upstream_tag }}
+      FORK_TAG: ${{ needs.select.outputs.fork_tag }}
+    steps:
+      - name: Enable long Git paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: stable
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge the upstream stable tag
+        id: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags https://github.com/pingdotgg/t3code.git "refs/tags/$env:UPSTREAM_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch upstream stable tag' }
+          $upstream = git rev-parse 'FETCH_HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve upstream commit' }
+          $version = $env:UPSTREAM_TAG.Substring(1)
+          foreach ($tag in (git tag --list 'julien/v*-r*')) {
+            if ($tag -match '^julien/v(\d+\.\d+\.\d+)-r\d+$' -and [version]$Matches[1] -gt [version]$version) {
+              throw "Refusing to build an upstream version older than $tag"
+            }
+          }
+          $tagExists = [bool](git tag --list $env:FORK_TAG)
+          if ($tagExists) {
+            # A prior attempt may have pushed the tag before uploading the release.
+            git checkout --detach "refs/tags/$env:FORK_TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not check out existing release tag' }
+          }
+          git merge-base --is-ancestor $upstream HEAD
+          if ($LASTEXITCODE -eq 1 -and !$tagExists) {
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git merge --no-commit --no-ff $upstream
+            git rev-parse --verify MERGE_HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Upstream merge did not start' }
+            # The fork owns its own workflow definitions.
+            git restore --source=HEAD --staged --worktree -- .github/workflows
+            if ($LASTEXITCODE -ne 0) { throw 'Could not preserve fork workflows' }
+            if (git diff --name-only --diff-filter=U) { throw 'Upstream merge has source conflicts' }
+            git commit -m "Merge upstream $env:UPSTREAM_TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not commit stable merge' }
+          } elseif ($LASTEXITCODE -ne 0) {
+            throw 'Existing release tag does not contain the expected upstream commit'
+          }
+          $package = Get-Content -Raw package.json | ConvertFrom-Json
+          if ($package.engines.node -notmatch '^\d+\.\d+\.\d+$' -or
+              $package.packageManager -notmatch '^pnpm@(\d+\.\d+\.\d+)$') {
+            throw 'The upstream build no longer specifies exact Node and pnpm versions'
+          }
+          "node=$($package.engines.node)" >> $env:GITHUB_OUTPUT
+          "pnpm=$($Matches[1])" >> $env:GITHUB_OUTPUT
+          "upstream_sha=$upstream" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ steps.source.outputs.node }}
+          package-manager-cache: false
+
+      - name: Install pinned dependencies
+        env:
+          PNPM_VERSION: ${{ steps.source.outputs.pnpm }}
+        run: |
+          npm install --global --ignore-scripts --no-audit --no-fund "pnpm@$env:PNPM_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --filter 't3...' --filter '@t3tools/monorepo' --filter '@t3tools/scripts...' install --frozen-lockfile --ignore-scripts
+
+      - name: Test browser routing and permission checks
+        run: |
+          node node_modules/vite-plus/bin/vp test run apps/server/src/provider/CodexDeveloperInstructions.test.ts apps/server/src/mcp/McpToolAccess.test.ts
+
+      - name: Test Windows worktree recovery
+        run: |
+          node node_modules/vite-plus/bin/vp test run apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts -t 'restores into a leftover worktree folder'
+
+      - name: Build the Windows x64 server
+        env:
+          APP_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $env:PATH = "$PWD\node_modules\.bin;$env:PATH"
+          node apps/server/scripts/cli.ts build-exe --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = & .\apps\server\dist-exe\t3.exe --version
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -ne "t3 v$env:APP_VERSION") {
+            throw "Unexpected server version: $version"
+          }
+          Get-FileHash .\apps\server\dist-exe\t3.exe -Algorithm SHA256
+
+      - name: Publish the tested commit and binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_EXISTS: ${{ steps.source.outputs.tag_exists }}
+          UPSTREAM_SHA: ${{ steps.source.outputs.upstream_sha }}
+        run: |
+          $binary = 'apps/server/dist-exe/t3.exe'
+          $checksum = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          $commit = git rev-parse HEAD
+          if ($env:TAG_EXISTS -ne 'true') {
+            git tag $env:FORK_TAG $commit
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create tested release tag' }
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push --atomic origin 'HEAD:refs/heads/stable' "refs/tags/$env:FORK_TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not push stable and the tested release tag' }
+          }
+          $notes = @"
+          Windows x64 server executable for the official $env:UPSTREAM_TAG CLI archive.
+          Upstream commit: $env:UPSTREAM_SHA
+          Fork commit: $commit
+          SHA-256 (t3.exe): $checksum
+          "@
+          gh release create $env:FORK_TAG $binary --repo $env:GITHUB_REPOSITORY --verify-tag --title $env:FORK_TAG --notes $notes
