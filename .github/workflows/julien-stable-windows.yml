@@ -61,11 +61,20 @@ jobs:
       - name: Enable long Git paths
         run: git config --global core.longpaths true
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: stable
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Check out the stable commit
+        run: |
+          # T3 vendors reference repositories with gitlinks but no root submodule registry.
+          # A plain checkout leaves those references alone.
+          git init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git remote add origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git fetch --no-tags origin 'refs/heads/stable:refs/remotes/origin/stable' 'refs/tags/julien/*:refs/tags/julien/*'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((git rev-parse refs/remotes/origin/stable) -ne $env:GITHUB_SHA) {
+            throw 'Stable moved since this workflow was queued'
+          }
+          git checkout --detach $env:GITHUB_SHA
 
       - name: Merge the upstream stable tag
         id: source
