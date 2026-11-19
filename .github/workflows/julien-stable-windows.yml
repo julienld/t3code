@@ -132,9 +132,15 @@ jobs:
         env:
           PNPM_VERSION: ${{ steps.source.outputs.pnpm }}
         run: |
-          npm install --global --ignore-scripts --no-audit --no-fund "pnpm@$env:PNPM_VERSION"
+          $tools = Join-Path $env:RUNNER_TEMP 't3-build-tools'
+          npm install --prefix $tools --ignore-scripts --no-audit --no-fund "pnpm@$env:PNPM_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pnpm --filter 't3...' --filter '@t3tools/monorepo' --filter '@t3tools/scripts...' install --frozen-lockfile --ignore-scripts
+          $pnpm = Join-Path $tools 'node_modules/pnpm/bin/pnpm.mjs'
+          node $pnpm --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node $pnpm --filter 't3...' --filter '@t3tools/monorepo' --filter '@t3tools/scripts...' install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path node_modules/vite-plus/bin/vp)) { throw 'Pinned test runner is absent after install' }
 
       - name: Test browser routing and permission checks
         run: |
