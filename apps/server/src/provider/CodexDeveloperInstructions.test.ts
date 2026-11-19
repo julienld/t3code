@@ -67,6 +67,20 @@ describe("Codex orchestration context", () => {
   });
 });
 
+describe("Codex browser routing", () => {
+  it.each([false, true])(
+    "honors the explicitly named permitted browser with preview=%s",
+    (browser) => {
+      const context = buildCodexAdditionalContext({ model: "test" }, { browser, device: false });
+      NodeAssert.match(
+        context.t3_code_orchestration_03!.value,
+        /the browser the user explicitly names if permitted by this session/,
+      );
+      NodeAssert.equal(Boolean(context.t3_code_tools), browser);
+    },
+  );
+});
+
 describe("Codex device context", () => {
   it("adds the shared device block only when the session holds device access", () => {
     const tools = (device: boolean) =>
