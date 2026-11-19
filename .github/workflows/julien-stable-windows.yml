@@ -143,12 +143,14 @@ jobs:
           if (!(Test-Path node_modules/vite-plus/bin/vp)) { throw 'Pinned test runner is absent after install' }
 
       - name: Test browser routing and permission checks
+        working-directory: apps/server
         run: |
-          node node_modules/vite-plus/bin/vp test run apps/server/src/provider/CodexDeveloperInstructions.test.ts apps/server/src/mcp/McpToolAccess.test.ts
+          node ../../node_modules/vite-plus/bin/vp test run --config vite.config.ts src/provider/CodexDeveloperInstructions.test.ts src/mcp/McpToolAccess.test.ts
 
       - name: Test Windows worktree recovery
+        working-directory: apps/server
         run: |
-          node node_modules/vite-plus/bin/vp test run apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts -t 'restores into a leftover worktree folder'
+          node ../../node_modules/vite-plus/bin/vp test run --config vite.config.ts src/orchestration-v2/ProviderTurnStartService.test.ts -t 'restores into a leftover worktree folder'
 
       - name: Build the Windows x64 server
         env:
